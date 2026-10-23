@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+requests
+google-auth
+google-cloud-storage
+supabase
+python-dotenv
