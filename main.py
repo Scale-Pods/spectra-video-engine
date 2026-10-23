@@ -27,16 +27,56 @@ app = FastAPI(title="Video Renderer", version="1.1.0")
 # ---------------------------------------------------------
 # Configuration & Environment
 # ---------------------------------------------------------
-PROJECT_ID = os.environ["GOOGLE_CLOUD_PROJECT"]
+def _load_sa_info():
+    sa_env = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+    if not sa_env:
+        return None
+    try:
+        return json.loads(sa_env)
+    except Exception:
+        try:
+            return json.loads(base64.b64decode(sa_env).decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse GCP_SERVICE_ACCOUNT_JSON: {e}")
+
+_sa_info = _load_sa_info()
+
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or (_sa_info.get("project_id") if _sa_info else None)
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 MODEL_ID = os.getenv("VEO_MODEL_ID", "veo-3.1-generate-001")
-VEO_OUTPUT_BUCKET = os.environ["VEO_OUTPUT_BUCKET"]
-RENDER_API_TOKEN = os.environ["RENDER_API_TOKEN"]
+VEO_OUTPUT_BUCKET = os.getenv("VEO_OUTPUT_BUCKET")
+RENDER_API_TOKEN = os.getenv("RENDER_API_TOKEN")
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_VIDEO_BUCKET", "generated-videos")
 SUPABASE_IS_PRIVATE = os.getenv("SUPABASE_BUCKET_PRIVATE", "false").lower() == "true"
+
+# Validate required configuration
+_missing_vars = []
+if not PROJECT_ID:
+    _missing_vars.append("GOOGLE_CLOUD_PROJECT (or GCP_SERVICE_ACCOUNT_JSON with 'project_id')")
+if not VEO_OUTPUT_BUCKET:
+    _missing_vars.append("VEO_OUTPUT_BUCKET")
+if not RENDER_API_TOKEN:
+    _missing_vars.append("RENDER_API_TOKEN")
+if not SUPABASE_URL:
+    _missing_vars.append("SUPABASE_URL")
+if not SUPABASE_KEY:
+    _missing_vars.append("SUPABASE_SERVICE_ROLE_KEY")
+
+if _missing_vars:
+    missing_list = "\n  - ".join(_missing_vars)
+    raise RuntimeError(
+        f"\n{'='*70}\n"
+        f"CONFIG ERROR: Missing required environment variables:\n  - {missing_list}\n\n"
+        f"If deploying on Railway:\n"
+        f"1. Open your project dashboard in Railway.\n"
+        f"2. Go to your service -> 'Variables' tab.\n"
+        f"3. Add all the required variables listed above.\n"
+        f"4. For Google Cloud auth, add 'GCP_SERVICE_ACCOUNT_JSON' with your service account key JSON.\n"
+        f"{'='*70}\n"
+    )
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -51,18 +91,19 @@ def get_gcp_credentials():
       2. GOOGLE_APPLICATION_CREDENTIALS file path.
       3. Application Default Credentials (ADC) for local development via gcloud CLI.
     """
-    sa_env = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-    if sa_env:
-        try:
-            sa_data = json.loads(sa_env)
-        except Exception:
-            sa_data = json.loads(base64.b64decode(sa_env).decode("utf-8"))
+    if _sa_info:
         return service_account.Credentials.from_service_account_info(
-            sa_data, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            _sa_info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
 
-    credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    return credentials
+    try:
+        credentials, _ = default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        return credentials
+    except Exception as e:
+        raise RuntimeError(
+            "Could not determine Google Cloud credentials. On Railway, please set "
+            "the 'GCP_SERVICE_ACCOUNT_JSON' environment variable to your service account key JSON (or base64 encoded)."
+        ) from e
 
 gcp_credentials = get_gcp_credentials()
 gcs = storage.Client(project=PROJECT_ID, credentials=gcp_credentials)
