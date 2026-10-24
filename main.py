@@ -623,29 +623,41 @@ def render_job(
     )
     if not row_response.data:
         now_iso = datetime.now(timezone.utc).isoformat()
+        topic_value = (request.topic or "").strip() or "A product launch"
+        payload = {
+            "id": request.jobId,
+            "topic": topic_value,
+            "aspect_ratio": request.aspectRatio or "9:16",
+            "resolution": request.resolution or "1080p",
+            "status": "pending",
+            "render_progress": {"stage": "queued", "percent": 0},
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        if request.voiceoverScript:
+            payload["voiceover_script"] = request.voiceoverScript
+        if request.voiceoverUrl:
+            payload["voiceover_url"] = request.voiceoverUrl
+        if request.musicPrompt:
+            payload["music_prompt"] = request.musicPrompt
+        if request.musicUrl:
+            payload["music_url"] = request.musicUrl
+
         try:
-            supabase.table("video_jobs").insert({
-                "id": request.jobId,
-                "topic": request.topic,
-                "aspect_ratio": request.aspectRatio,
-                "resolution": request.resolution,
-                "status": "pending",
-                "voiceover_script": request.voiceoverScript,
-                "voiceover_url": request.voiceoverUrl,
-                "music_prompt": request.musicPrompt,
-                "music_url": request.musicUrl,
-                "created_at": now_iso,
-                "updated_at": now_iso,
-            }).execute()
-        except Exception:
-            # Fallback if specific schema columns differ
+            supabase.table("video_jobs").insert(payload).execute()
+        except Exception as e1:
+            print(f"Notice: full payload insert failed ({e1}), retrying with minimal payload...")
             try:
-                supabase.table("video_jobs").insert({
+                minimal_payload = {
                     "id": request.jobId,
+                    "topic": topic_value,
                     "status": "pending",
+                    "aspect_ratio": request.aspectRatio or "9:16",
+                    "resolution": request.resolution or "1080p",
                     "created_at": now_iso,
                     "updated_at": now_iso,
-                }).execute()
+                }
+                supabase.table("video_jobs").insert(minimal_payload).execute()
             except Exception as e2:
                 raise HTTPException(status_code=500, detail=f"Failed to create job in database: {e2}")
         existing = {"id": request.jobId, "status": "pending"}
