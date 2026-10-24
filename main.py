@@ -621,7 +621,8 @@ def render_job(
         .limit(1)
         .execute()
     )
-    if not row_response.data:
+    is_new = not row_response.data
+    if is_new:
         now_iso = datetime.now(timezone.utc).isoformat()
         topic_value = (request.topic or "").strip() or "A product launch"
         payload = {
@@ -660,28 +661,27 @@ def render_job(
                 supabase.table("video_jobs").insert(minimal_payload).execute()
             except Exception as e2:
                 raise HTTPException(status_code=500, detail=f"Failed to create job in database: {e2}")
-        existing = {"id": request.jobId, "status": "rendering"}
     else:
         existing = row_response.data[0]
-    # Idempotency: if already finished, return immediate success
-    if existing.get("status") == "completed" and existing.get("output_video_url"):
-        return {
-            "jobId": request.jobId,
-            "status": "completed",
-            "outputVideoUrl": existing["output_video_url"],
-            "renderProgress": {"stage": "completed", "percent": 100},
-            "message": "Job has already completed",
-        }
+        # Idempotency: if already finished, return immediate success
+        if existing.get("status") == "completed" and existing.get("output_video_url"):
+            return {
+                "jobId": request.jobId,
+                "status": "completed",
+                "outputVideoUrl": existing["output_video_url"],
+                "renderProgress": {"stage": "completed", "percent": 100},
+                "message": "Job has already completed",
+            }
 
-    # If already rendering, acknowledge without spawning duplicate background task
-    if existing.get("status") == "rendering":
-        return {
-            "jobId": request.jobId,
-            "status": "rendering",
-            "message": "Job is currently already rendering in background",
-        }
+        # If already rendering, acknowledge without spawning duplicate background task
+        if existing.get("status") == "rendering":
+            return {
+                "jobId": request.jobId,
+                "status": "rendering",
+                "message": "Job is currently already rendering in background",
+            }
 
-    # Queue background task
+    # Queue background task for newly created jobs or re-queued jobs
     background_tasks.add_task(process_render_job, request)
 
     return {
