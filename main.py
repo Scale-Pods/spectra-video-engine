@@ -124,7 +124,7 @@ class Shot(BaseModel):
     durationS: int = 8
 
 class RenderRequest(BaseModel):
-    jobId: str
+    jobId: Optional[str] = None
     topic: str = ""
     aspectRatio: str = "9:16"
     resolution: str = "720p"
@@ -378,14 +378,37 @@ def mix_audio(
             str(final_output),
         ])
 
+def ensure_supabase_bucket():
+    """Ensures the target Supabase storage bucket exists and has correct public/private settings."""
+    try:
+        buckets = supabase.storage.list_buckets()
+        existing = {
+            b.id if hasattr(b, "id") else (b.get("id") or b.get("name"))
+            for b in buckets
+        }
+        if SUPABASE_BUCKET not in existing:
+            supabase.storage.create_bucket(
+                SUPABASE_BUCKET,
+                options={"public": not SUPABASE_IS_PRIVATE},
+            )
+    except Exception as exc:
+        print(f"Warning: could not verify/create Supabase bucket '{SUPABASE_BUCKET}': {exc}")
+
+ensure_supabase_bucket()
+
 def upload_final_video(output: Path, job_id: str) -> str:
+    ensure_supabase_bucket()
     object_path = f"{job_id}/final-{uuid.uuid4().hex[:8]}.mp4"
     with output.open("rb") as f:
-        supabase.storage.from_(SUPABASE_BUCKET).upload(
+        res = supabase.storage.from_(SUPABASE_BUCKET).upload(
             object_path,
             f,
             file_options={"content-type": "video/mp4", "upsert": "true"},
         )
+        if hasattr(res, "status_code") and res.status_code >= 400:
+            raise RuntimeError(f"Supabase upload failed ({res.status_code}): {getattr(res, 'text', '')}")
+        if isinstance(res, dict) and res.get("error"):
+            raise RuntimeError(f"Supabase upload failed: {res['error']}")
 
     if SUPABASE_IS_PRIVATE:
         # Generate a 7-day signed URL for private storage buckets
@@ -576,10 +599,13 @@ def render_job(
     if authorization != f"Bearer {RENDER_API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    try:
-        uuid.UUID(request.jobId)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid jobId format")
+    if not request.jobId:
+        request.jobId = str(uuid.uuid4())
+    else:
+        try:
+            uuid.UUID(request.jobId)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid jobId format")
 
     if request.aspectRatio not in ("9:16", "16:9"):
         raise HTTPException(status_code=400, detail="Unsupported aspectRatio (expected '9:16' or '16:9')")
@@ -587,7 +613,7 @@ def render_job(
     if request.resolution not in ("720p", "1080p"):
         raise HTTPException(status_code=400, detail="Unsupported resolution (expected '720p' or '1080p')")
 
-    # Fetch job from Supabase
+    # Fetch job from Supabase (or auto-create if missing)
     row_response = (
         supabase.table("video_jobs")
         .select("id,status,output_video_url")
@@ -596,9 +622,35 @@ def render_job(
         .execute()
     )
     if not row_response.data:
-        raise HTTPException(status_code=404, detail="Job not found in database")
-
-    existing = row_response.data[0]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            supabase.table("video_jobs").insert({
+                "id": request.jobId,
+                "topic": request.topic,
+                "aspect_ratio": request.aspectRatio,
+                "resolution": request.resolution,
+                "status": "pending",
+                "voiceover_script": request.voiceoverScript,
+                "voiceover_url": request.voiceoverUrl,
+                "music_prompt": request.musicPrompt,
+                "music_url": request.musicUrl,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            }).execute()
+        except Exception:
+            # Fallback if specific schema columns differ
+            try:
+                supabase.table("video_jobs").insert({
+                    "id": request.jobId,
+                    "status": "pending",
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                }).execute()
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"Failed to create job in database: {e2}")
+        existing = {"id": request.jobId, "status": "pending"}
+    else:
+        existing = row_response.data[0]
     # Idempotency: if already finished, return immediate success
     if existing.get("status") == "completed" and existing.get("output_video_url"):
         return {
