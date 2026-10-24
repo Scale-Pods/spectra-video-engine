@@ -44,6 +44,7 @@ _sa_info = _load_sa_info()
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or (_sa_info.get("project_id") if _sa_info else None)
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 MODEL_ID = os.getenv("VEO_MODEL_ID", "veo-3.1-generate-001")
+LYRIA_MODEL_ID = os.getenv("LYRIA_MODEL_ID", "lyria-002")
 VEO_OUTPUT_BUCKET = os.getenv("VEO_OUTPUT_BUCKET")
 RENDER_API_TOKEN = os.getenv("RENDER_API_TOKEN")
 
@@ -275,6 +276,59 @@ def generate_one_clip(
             time.sleep(wait_sec)
 
     raise RuntimeError(f"Veo generation failed for shot {shot.index} after {max_retries} attempts.")
+
+def generate_lyria_music(prompt: str, output_path: Path) -> Optional[Path]:
+    """
+    Generates background music using Google Lyria (lyria-002) on Vertex AI.
+    Returns the path to the downloaded MP3, or None if generation fails.
+    """
+    if not prompt or not prompt.strip():
+        return None
+
+    try:
+        token = google_access_token()
+        endpoint = (
+            f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+            f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+            f"publishers/google/models/{LYRIA_MODEL_ID}:predict"
+        )
+        print(f"Generating background music with Google Lyria: '{prompt[:75]}...'")
+        resp = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "instances": [
+                    {
+                        "prompt": prompt,
+                        "negative_prompt": "vocals, singing, speech, lyrics, distortion",
+                    }
+                ],
+                "parameters": {
+                    "sample_count": 1,
+                },
+            },
+            timeout=120,
+        )
+
+        if resp.status_code == 200:
+            predictions = resp.json().get("predictions", [])
+            if predictions:
+                pred = predictions[0]
+                b64_str = pred.get("bytesBase64Encoded") or pred.get("audioContent")
+                if b64_str:
+                    audio_bytes = base64.b64decode(b64_str)
+                    with output_path.open("wb") as f:
+                        f.write(audio_bytes)
+                    print(f"Google Lyria music generated successfully ({len(audio_bytes)} bytes).")
+                    return output_path
+        print(f"Lyria note ({resp.status_code}): {resp.text[:250]}")
+    except Exception as exc:
+        print(f"Warning: could not generate Lyria music ({exc})")
+
+    return None
 
 # ---------------------------------------------------------
 # FFmpeg Video Processing & Audio Mixing
@@ -540,9 +594,13 @@ def process_render_job(request: RenderRequest):
                 vo_path = download_http_asset(vo_url, workdir / "voiceover.mp3")
 
             bgm_url = request.musicUrl or db_row.get("music_url")
+            music_prompt = request.musicPrompt or db_row.get("music_prompt")
             music_path = None
             if bgm_url:
                 music_path = download_http_asset(bgm_url, workdir / "music.mp3")
+            elif music_prompt:
+                # Automatically generate background music using Google Lyria
+                music_path = generate_lyria_music(music_prompt, workdir / "lyria_music.mp3")
 
             # 3. Stitch Video Clips
             supabase.table("video_jobs").update({
@@ -598,6 +656,7 @@ def health():
         "gcp_project": PROJECT_ID,
         "gcp_location": LOCATION,
         "veo_model": MODEL_ID,
+        "lyria_model": LYRIA_MODEL_ID,
     }
 
 @app.get("/jobs/{jobId}")
