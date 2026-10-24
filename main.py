@@ -629,7 +629,7 @@ def render_job(
             "topic": topic_value,
             "aspect_ratio": request.aspectRatio or "9:16",
             "resolution": request.resolution or "1080p",
-            "status": "pending",
+            "status": "rendering",
             "render_progress": {"stage": "queued", "percent": 0},
             "created_at": now_iso,
             "updated_at": now_iso,
@@ -651,7 +651,7 @@ def render_job(
                 minimal_payload = {
                     "id": request.jobId,
                     "topic": topic_value,
-                    "status": "pending",
+                    "status": "rendering",
                     "aspect_ratio": request.aspectRatio or "9:16",
                     "resolution": request.resolution or "1080p",
                     "created_at": now_iso,
@@ -660,7 +660,7 @@ def render_job(
                 supabase.table("video_jobs").insert(minimal_payload).execute()
             except Exception as e2:
                 raise HTTPException(status_code=500, detail=f"Failed to create job in database: {e2}")
-        existing = {"id": request.jobId, "status": "pending"}
+        existing = {"id": request.jobId, "status": "rendering"}
     else:
         existing = row_response.data[0]
     # Idempotency: if already finished, return immediate success
