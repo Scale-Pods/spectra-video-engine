@@ -168,81 +168,106 @@ def generate_one_clip(
     Submits a prediction request to Google Veo on Vertex AI and polls until completion.
     Returns (local_clip_path, gcs_uri).
     """
-    token = google_access_token()
-    endpoint = (
-        f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
-        f"projects/{PROJECT_ID}/locations/{LOCATION}/"
-        f"publishers/google/models/{MODEL_ID}:predictLongRunning"
-    )
+    max_retries = 3
+    base_backoff = 25  # seconds
 
-    output_prefix = f"gs://{VEO_OUTPUT_BUCKET}/{job_id}/shot-{shot.index}/"
+    for attempt in range(1, max_retries + 1):
+        try:
+            token = google_access_token()
+            endpoint = (
+                f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+                f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+                f"publishers/google/models/{MODEL_ID}:predictLongRunning"
+            )
 
-    params: dict[str, Any] = {
-        "storageUri": output_prefix,
-        "sampleCount": 1,
-        "aspectRatio": aspect_ratio,
-        "durationSeconds": shot.durationS,
-        "resolution": resolution,
-    }
-    if shot.negativePrompt:
-        params["negativePrompt"] = shot.negativePrompt
+            output_prefix = f"gs://{VEO_OUTPUT_BUCKET}/{job_id}/shot-{shot.index}/"
 
-    response = requests.post(
-        endpoint,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "instances": [{"prompt": shot.prompt}],
-            "parameters": params,
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    operation_name = response.json().get("name")
-    if not operation_name:
-        raise RuntimeError(f"Veo did not return an operation name: {response.text}")
+            params: dict[str, Any] = {
+                "storageUri": output_prefix,
+                "sampleCount": 1,
+                "aspectRatio": aspect_ratio,
+                "durationSeconds": shot.durationS,
+                "resolution": resolution,
+            }
+            if shot.negativePrompt:
+                params["negativePrompt"] = shot.negativePrompt
 
-    poll_endpoint = (
-        f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
-        f"projects/{PROJECT_ID}/locations/{LOCATION}/"
-        f"publishers/google/models/{MODEL_ID}:fetchPredictOperation"
-    )
+            response = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "instances": [{"prompt": shot.prompt}],
+                    "parameters": params,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            operation_name = response.json().get("name")
+            if not operation_name:
+                raise RuntimeError(f"Veo did not return an operation name: {response.text}")
 
-    deadline = time.monotonic() + 1800  # 30-minute timeout per clip
-    result = None
+            poll_endpoint = (
+                f"https://{LOCATION}-aiplatform.googleapis.com/v1/"
+                f"projects/{PROJECT_ID}/locations/{LOCATION}/"
+                f"publishers/google/models/{MODEL_ID}:fetchPredictOperation"
+            )
 
-    while time.monotonic() < deadline:
-        time.sleep(12)
-        token = google_access_token()
-        poll = requests.post(
-            poll_endpoint,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={"operationName": operation_name},
-            timeout=60,
-        )
-        poll.raise_for_status()
-        result = poll.json()
+            deadline = time.monotonic() + 1800  # 30-minute timeout per clip
+            result = None
 
-        if result.get("error"):
-            raise RuntimeError(f"Veo generation failed: {result['error']}")
-        if result.get("done"):
-            break
-    else:
-        raise TimeoutError(f"Veo operation timed out: {operation_name}")
+            while time.monotonic() < deadline:
+                time.sleep(12)
+                token = google_access_token()
+                poll = requests.post(
+                    poll_endpoint,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"operationName": operation_name},
+                    timeout=60,
+                )
+                poll.raise_for_status()
+                result = poll.json()
 
-    videos = result.get("response", {}).get("videos", [])
-    if not videos or not videos[0].get("gcsUri"):
-        raise RuntimeError(f"Veo finished without returning a video GCS URI: {result}")
+                if result.get("error"):
+                    err = result["error"]
+                    err_code = err.get("code")
+                    err_msg = str(err.get("message", ""))
+                    if (err_code == 8 or "high load" in err_msg.lower() or "resource" in err_msg.lower()) and attempt < max_retries:
+                        wait_sec = base_backoff * attempt
+                        print(f"Veo high load for shot {shot.index} (attempt {attempt}/{max_retries}). Retrying in {wait_sec}s...")
+                        time.sleep(wait_sec)
+                        break
+                    raise RuntimeError(f"Veo generation failed: {err}")
+                if result.get("done"):
+                    break
+            else:
+                raise TimeoutError(f"Veo operation timed out: {operation_name}")
 
-    gcs_uri = videos[0]["gcsUri"]
-    output = workdir / f"shot-{shot.index:02d}.mp4"
-    download_gcs_video(gcs_uri, output)
-    return output, gcs_uri
+            if result.get("error"):
+                continue
+
+            videos = result.get("response", {}).get("videos", [])
+            if not videos or not videos[0].get("gcsUri"):
+                raise RuntimeError(f"Veo finished without returning a video GCS URI: {result}")
+
+            gcs_uri = videos[0]["gcsUri"]
+            output = workdir / f"shot-{shot.index:02d}.mp4"
+            download_gcs_video(gcs_uri, output)
+            return output, gcs_uri
+
+        except Exception as exc:
+            if attempt >= max_retries or "high load" not in str(exc).lower():
+                raise
+            wait_sec = base_backoff * attempt
+            print(f"Transient error on shot {shot.index} (attempt {attempt}/{max_retries}): {exc}. Retrying in {wait_sec}s...")
+            time.sleep(wait_sec)
+
+    raise RuntimeError(f"Veo generation failed for shot {shot.index} after {max_retries} attempts.")
 
 # ---------------------------------------------------------
 # FFmpeg Video Processing & Audio Mixing
