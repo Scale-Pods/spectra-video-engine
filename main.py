@@ -1,10 +1,12 @@
 import os
+import re
 import json
 import base64
 import time
 import uuid
 import shutil
 import tempfile
+import textwrap
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Optional, Any
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from google.auth import default
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -119,12 +121,16 @@ def google_access_token() -> str:
 # Request Models
 # ---------------------------------------------------------
 class Shot(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     index: int
     prompt: str = Field(min_length=5)
     negativePrompt: str = ""
     durationS: int = 8
+    onScreenText: Optional[str] = None
+    on_screen_text: Optional[str] = None
 
 class RenderRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     jobId: Optional[str] = None
     id: Optional[str] = None
     topic: str = ""
@@ -342,10 +348,126 @@ def run_ffmpeg(args: list[str]):
     if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg failed (exit code {proc.returncode}): {proc.stderr}")
 
-def stitch_clips(clips: list[Path], output: Path, aspect_ratio: str, resolution: str):
+def find_system_font() -> Optional[str]:
+    """Finds a clean bold sans-serif font for ad subtitles."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+    return None
+
+def wrap_subtitle(text: str, max_chars_per_line: int = 26) -> str:
+    """Wraps subtitle lines cleanly for mobile ad safe zones."""
+    if not text:
+        return ""
+    lines = textwrap.wrap(text, width=max_chars_per_line)
+    return "\n".join(lines)
+
+def assign_shot_subtitles(shots_count: int, explicit_texts: list[str], voiceover_script: Optional[str]) -> list[str]:
+    """
+    Determines the subtitle text for each shot.
+    Prioritizes explicit shot text/onScreenText; otherwise partitions the voiceover script across shots.
+    """
+    if any(t and t.strip() for t in explicit_texts):
+        return [t.strip() if t else "" for t in explicit_texts]
+
+    if not voiceover_script or not voiceover_script.strip():
+        return ["" for _ in range(shots_count)]
+
+    clean_script = voiceover_script.strip()
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n+', clean_script) if s.strip()]
+    if not sentences:
+        sentences = [clean_script]
+
+    if len(sentences) >= shots_count:
+        assigned = []
+        for i in range(shots_count):
+            start = int(i * len(sentences) / shots_count)
+            end = int((i + 1) * len(sentences) / shots_count)
+            assigned.append(" ".join(sentences[start:max(start + 1, end)]))
+        return assigned
+    else:
+        parts = [p.strip() for p in re.split(r'[,;]\s+', clean_script) if p.strip()]
+        if len(parts) >= shots_count:
+            assigned = []
+            for i in range(shots_count):
+                start = int(i * len(parts) / shots_count)
+                end = int((i + 1) * len(parts) / shots_count)
+                assigned.append(" ".join(parts[start:max(start + 1, end)]))
+            return assigned
+        else:
+            words = clean_script.split()
+            chunk_size = max(1, len(words) // shots_count)
+            assigned = []
+            for i in range(shots_count):
+                if i == shots_count - 1:
+                    assigned.append(" ".join(words[i * chunk_size:]))
+                else:
+                    assigned.append(" ".join(words[i * chunk_size:(i + 1) * chunk_size]))
+            return assigned
+
+def calculate_job_cost(
+    shots: list[Shot],
+    resolution: str,
+    voiceover_script: Optional[str] = None,
+    has_voiceover_url: bool = False,
+    music_prompt: Optional[str] = None,
+    has_music_url: bool = False,
+) -> dict:
+    """
+    Calculates actual money spent for this video generation job:
+      - Google Veo 3.1: $0.12/s for 1080p, $0.10/s for 720p
+      - OpenAI TTS: ~$0.015 per 1,000 characters
+      - Google Lyria: ~$0.030 per track
+    """
+    is_1080p = "1080" in resolution
+    rate_per_sec = 0.12 if is_1080p else 0.10
+    total_seconds = sum(getattr(s, "durationS", 8) or 8 for s in shots)
+    veo_cost = round(total_seconds * rate_per_sec, 4)
+
+    vo_cost = 0.0
+    if voiceover_script and voiceover_script.strip():
+        char_count = len(voiceover_script.strip())
+        vo_cost = round((char_count / 1000.0) * 0.015, 4)
+    elif has_voiceover_url:
+        vo_cost = 0.005
+
+    music_cost = 0.0
+    if music_prompt and music_prompt.strip():
+        music_cost = 0.030
+
+    total_cost = round(veo_cost + vo_cost + music_cost, 4)
+    return {
+        "actual_cost_usd": total_cost,
+        "cost_breakdown": {
+            "total_usd": total_cost,
+            "veo_usd": veo_cost,
+            "voiceover_usd": vo_cost,
+            "music_usd": music_cost,
+            "video_duration_seconds": total_seconds,
+            "resolution": resolution,
+            "shots_count": len(shots),
+        },
+    }
+
+def stitch_clips(
+    clips: list[Path],
+    output: Path,
+    aspect_ratio: str,
+    resolution: str,
+    subtitles: Optional[list[str]] = None,
+):
     """
     Normalizes every clip to identical resolution, framerate, and pixel format,
-    then concatenates them into a continuous video.
+    burns high-converting Meta / Google Ads subtitles in safe zones, and concatenates.
     """
     is_1080p = "1080" in resolution
     if aspect_ratio == "16:9":
@@ -353,15 +475,55 @@ def stitch_clips(clips: list[Path], output: Path, aspect_ratio: str, resolution:
     else:  # 9:16 vertical
         width, height = (1080, 1920) if is_1080p else (720, 1280)
 
+    font_path = find_system_font()
+    esc_font = font_path.replace(":", "\\:") if font_path else None
+
     normalized = []
     for i, clip in enumerate(clips):
         norm_path = output.parent / f"norm-{i:02d}.mp4"
+        vf_filters = [
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+            "setsar=1",
+            "fps=30",
+            "format=yuv420p",
+        ]
+
+        # Add subtitle overlay for Meta / Google Ads
+        sub_text = subtitles[i] if subtitles and i < len(subtitles) else ""
+        if sub_text and sub_text.strip():
+            max_chars = 26 if aspect_ratio == "9:16" else 46
+            wrapped = wrap_subtitle(sub_text.strip(), max_chars_per_line=max_chars)
+            sub_file = output.parent / f"sub-{i:02d}.txt"
+            with sub_file.open("w", encoding="utf-8") as f:
+                f.write(wrapped)
+
+            esc_sub = sub_file.as_posix().replace(":", "\\:")
+            fontsize = 44 if is_1080p else 32
+            if aspect_ratio == "16:9":
+                fontsize = 36 if is_1080p else 26
+                y_pos = "h*0.80-text_h/2"
+            else:
+                # 9:16 Meta / TikTok / Reels safe zone
+                y_pos = "h*0.72-text_h/2"
+
+            if esc_font:
+                drawtext_arg = (
+                    f"drawtext=fontfile='{esc_font}':textfile='{esc_sub}':"
+                    f"fontsize={fontsize}:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=16:"
+                    f"line_spacing=10:x=(w-text_w)/2:y={y_pos}"
+                )
+            else:
+                drawtext_arg = (
+                    f"drawtext=textfile='{esc_sub}':"
+                    f"fontsize={fontsize}:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=16:"
+                    f"line_spacing=10:x=(w-text_w)/2:y={y_pos}"
+                )
+            vf_filters.append(drawtext_arg)
+
         run_ffmpeg([
             "-y", "-i", str(clip),
-            "-vf",
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-            "setsar=1,fps=30,format=yuv420p",
+            "-vf", ",".join(vf_filters),
             "-an",
             "-c:v", "libx264",
             "-preset", "veryfast",
@@ -602,14 +764,22 @@ def process_render_job(request: RenderRequest):
                 # Automatically generate background music using Google Lyria
                 music_path = generate_lyria_music(music_prompt, workdir / "lyria_music.mp3")
 
-            # 3. Stitch Video Clips
+            # 3. Stitch Video Clips (with safe-zone Meta/Google Ads subtitles)
             supabase.table("video_jobs").update({
                 "render_progress": {"stage": "stitching_video", "percent": 85},
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", request.jobId).execute()
 
+            # Determine subtitle overlay for each shot
+            explicit_texts = [
+                getattr(s, "onScreenText", None) or getattr(s, "on_screen_text", None)
+                for s in request.shots
+            ]
+            vo_script = request.voiceoverScript or db_row.get("voiceover_script")
+            subtitles = assign_shot_subtitles(len(request.shots), explicit_texts, vo_script)
+
             stitched_video = workdir / "stitched_raw.mp4"
-            stitch_clips(clips, stitched_video, request.aspectRatio, request.resolution)
+            stitch_clips(clips, stitched_video, request.aspectRatio, request.resolution, subtitles=subtitles)
 
             # 4. Mix Audio
             supabase.table("video_jobs").update({
@@ -628,14 +798,38 @@ def process_render_job(request: RenderRequest):
 
             output_url = upload_final_video(final_mp4, request.jobId)
 
-            # 6. Mark Job Completed
-            supabase.table("video_jobs").update({
+            # 6. Calculate Actual Money Spent
+            cost_info = calculate_job_cost(
+                shots=request.shots,
+                resolution=request.resolution,
+                voiceover_script=vo_script,
+                has_voiceover_url=bool(vo_path),
+                music_prompt=music_prompt,
+                has_music_url=bool(music_path),
+            )
+            actual_cost = cost_info["actual_cost_usd"]
+            cost_breakdown = cost_info["cost_breakdown"]
+
+            # 7. Mark Job Completed & Save Actual Cost to Supabase for Frontend
+            completion_payload = {
                 "status": "completed",
                 "output_video_url": output_url,
+                "actual_cost_usd": actual_cost,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
-                "render_progress": {"stage": "completed", "percent": 100},
+                "render_progress": {
+                    "stage": "completed",
+                    "percent": 100,
+                    "cost_breakdown": cost_breakdown,
+                },
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", request.jobId).execute()
+            }
+
+            try:
+                supabase.table("video_jobs").update(completion_payload).eq("id", request.jobId).execute()
+            except Exception as e_cost:
+                print(f"Notice: saving actual_cost_usd failed ({e_cost}), retrying without column...")
+                completion_payload.pop("actual_cost_usd", None)
+                supabase.table("video_jobs").update(completion_payload).eq("id", request.jobId).execute()
 
     except Exception as exc:
         supabase.table("video_jobs").update({
@@ -674,7 +868,7 @@ def get_job_status(
 
     row_res = (
         supabase.table("video_jobs")
-        .select("id,status,render_progress,output_video_url,error_detail,completed_at,created_at,updated_at")
+        .select("id,status,actual_cost_usd,estimated_cost_usd,render_progress,output_video_url,error_detail,completed_at,created_at,updated_at")
         .eq("id", jobId)
         .limit(1)
         .execute()
@@ -752,12 +946,22 @@ def render_job(
         if isinstance(s, Shot):
             parsed_shots.append(s)
         elif isinstance(s, dict):
+            text_val = (
+                s.get("onScreenText")
+                or s.get("on_screen_text")
+                or s.get("text")
+                or s.get("subtitle")
+                or s.get("voiceover")
+                or s.get("voiceover_script")
+            )
             parsed_shots.append(
                 Shot(
                     index=s.get("index", len(parsed_shots)),
                     prompt=s.get("prompt", ""),
                     negativePrompt=s.get("negativePrompt", "") or s.get("negative_prompt", ""),
                     durationS=s.get("durationS", 8) or s.get("duration_s", 8),
+                    onScreenText=text_val,
+                    on_screen_text=text_val,
                 )
             )
     request.shots = parsed_shots

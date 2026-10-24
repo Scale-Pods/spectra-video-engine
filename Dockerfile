@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
-# Install system dependencies including FFmpeg and curl
+# Install system dependencies including FFmpeg, curl, and fonts for ad subtitles
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
