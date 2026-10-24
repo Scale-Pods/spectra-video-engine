@@ -125,14 +125,21 @@ class Shot(BaseModel):
 
 class RenderRequest(BaseModel):
     jobId: Optional[str] = None
+    id: Optional[str] = None
     topic: str = ""
-    aspectRatio: str = "9:16"
-    resolution: str = "720p"
-    shots: list[Shot] = Field(min_length=1, max_length=10)
+    aspectRatio: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+    resolution: str = "1080p"
+    shots: Optional[list[Shot]] = None
+    shots_json: Optional[Any] = None
     voiceoverScript: Optional[str] = None
+    voiceover_script: Optional[str] = None
     voiceoverUrl: Optional[str] = None
+    voiceover_url: Optional[str] = None
     musicPrompt: Optional[str] = None
+    music_prompt: Optional[str] = None
     musicUrl: Optional[str] = None
+    music_url: Optional[str] = None
 
 # ---------------------------------------------------------
 # Helper Functions: Storage, Download & Video Generation
@@ -464,17 +471,18 @@ def process_render_job(request: RenderRequest):
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", request.jobId).execute()
 
-        # Fetch current record to support checkpointed clip reuse
+        # Fetch current record to support checkpointed clip reuse and audio assets
         row_res = (
             supabase.table("video_jobs")
-            .select("shots_json")
+            .select("shots_json,voiceover_url,music_url")
             .eq("id", request.jobId)
             .limit(1)
             .execute()
         )
         existing_shots_dict = {}
-        if row_res.data and row_res.data[0].get("shots_json"):
-            for s in row_res.data[0]["shots_json"]:
+        db_row = row_res.data[0] if (row_res.data and len(row_res.data) > 0) else {}
+        if db_row.get("shots_json"):
+            for s in db_row["shots_json"]:
                 if isinstance(s, dict) and "index" in s:
                     existing_shots_dict[s["index"]] = s
 
@@ -520,19 +528,21 @@ def process_render_job(request: RenderRequest):
                     "shots_json": updated_shots_json
                 }).eq("id", request.jobId).execute()
 
-            # 2. Download audio assets
+            # 2. Download audio assets (checks request and falls back to Supabase row)
             supabase.table("video_jobs").update({
                 "render_progress": {"stage": "processing_audio", "percent": 75},
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", request.jobId).execute()
 
+            vo_url = request.voiceoverUrl or db_row.get("voiceover_url")
             vo_path = None
-            if request.voiceoverUrl:
-                vo_path = download_http_asset(request.voiceoverUrl, workdir / "voiceover.mp3")
+            if vo_url:
+                vo_path = download_http_asset(vo_url, workdir / "voiceover.mp3")
 
+            bgm_url = request.musicUrl or db_row.get("music_url")
             music_path = None
-            if request.musicUrl:
-                music_path = download_http_asset(request.musicUrl, workdir / "music.mp3")
+            if bgm_url:
+                music_path = download_http_asset(bgm_url, workdir / "music.mp3")
 
             # 3. Stitch Video Clips
             supabase.table("video_jobs").update({
@@ -624,6 +634,7 @@ def render_job(
     if authorization != f"Bearer {RENDER_API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    request.jobId = request.jobId or request.id
     if not request.jobId:
         request.jobId = str(uuid.uuid4())
     else:
@@ -632,20 +643,65 @@ def render_job(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid jobId format")
 
+    request.aspectRatio = request.aspectRatio or request.aspect_ratio or "9:16"
     if request.aspectRatio not in ("9:16", "16:9"):
         raise HTTPException(status_code=400, detail="Unsupported aspectRatio (expected '9:16' or '16:9')")
 
     if request.resolution not in ("720p", "1080p"):
-        raise HTTPException(status_code=400, detail="Unsupported resolution (expected '720p' or '1080p')")
+        request.resolution = "1080p"
+
+    request.voiceoverUrl = request.voiceoverUrl or request.voiceover_url
+    request.musicUrl = request.musicUrl or request.music_url
+    request.voiceoverScript = request.voiceoverScript or request.voiceover_script
+    request.musicPrompt = request.musicPrompt or request.music_prompt
 
     # Fetch job from Supabase (or auto-create if missing)
     row_response = (
         supabase.table("video_jobs")
-        .select("id,status,output_video_url")
+        .select("id,status,output_video_url,shots_json")
         .eq("id", request.jobId)
         .limit(1)
         .execute()
     )
+
+    # Normalize shots from request.shots, request.shots_json, or Supabase row
+    raw_shots = request.shots
+    if not raw_shots and request.shots_json:
+        if isinstance(request.shots_json, str):
+            try:
+                raw_shots = json.loads(request.shots_json)
+            except Exception:
+                raw_shots = []
+        elif isinstance(request.shots_json, list):
+            raw_shots = request.shots_json
+
+    if not raw_shots and row_response.data and row_response.data[0].get("shots_json"):
+        db_shots = row_response.data[0]["shots_json"]
+        if isinstance(db_shots, str):
+            try:
+                raw_shots = json.loads(db_shots)
+            except Exception:
+                raw_shots = []
+        elif isinstance(db_shots, list):
+            raw_shots = db_shots
+
+    if not raw_shots:
+        raise HTTPException(status_code=400, detail="Missing required 'shots' or 'shots_json' array.")
+
+    parsed_shots = []
+    for s in raw_shots:
+        if isinstance(s, Shot):
+            parsed_shots.append(s)
+        elif isinstance(s, dict):
+            parsed_shots.append(
+                Shot(
+                    index=s.get("index", len(parsed_shots)),
+                    prompt=s.get("prompt", ""),
+                    negativePrompt=s.get("negativePrompt", "") or s.get("negative_prompt", ""),
+                    durationS=s.get("durationS", 8) or s.get("duration_s", 8),
+                )
+            )
+    request.shots = parsed_shots
     is_new = not row_response.data
     if is_new:
         now_iso = datetime.now(timezone.utc).isoformat()
