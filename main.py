@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import textwrap
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Any
@@ -117,15 +118,19 @@ def google_access_token() -> str:
         gcp_credentials.refresh(GoogleAuthRequest())
     return gcp_credentials.token
 
+# In-memory tracking of currently running background jobs to avoid duplicate execution
+active_jobs: set[str] = set()
+active_jobs_lock = threading.Lock()
+
 # ---------------------------------------------------------
 # Request Models
 # ---------------------------------------------------------
 class Shot(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    index: int
-    prompt: str = Field(min_length=5)
-    negativePrompt: str = ""
-    durationS: int = 8
+    index: int = 0
+    prompt: Optional[str] = "Cinematic high quality shot"
+    negativePrompt: Optional[str] = ""
+    durationS: Optional[int] = 8
     onScreenText: Optional[str] = None
     on_screen_text: Optional[str] = None
 
@@ -133,11 +138,11 @@ class RenderRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     jobId: Optional[str] = None
     id: Optional[str] = None
-    topic: str = ""
+    topic: Optional[str] = "A product launch"
     aspectRatio: Optional[str] = None
     aspect_ratio: Optional[str] = None
-    resolution: str = "1080p"
-    shots: Optional[list[Shot]] = None
+    resolution: Optional[str] = "1080p"
+    shots: Optional[list[Any]] = None
     shots_json: Optional[Any] = None
     voiceoverScript: Optional[str] = None
     voiceover_script: Optional[str] = None
@@ -679,8 +684,14 @@ def process_render_job(request: RenderRequest):
     4. Mixes audio tracks.
     5. Uploads to Supabase Storage and updates the database row.
     """
+    with active_jobs_lock:
+        if request.jobId in active_jobs:
+            print(f"Job {request.jobId} is already actively being processed.")
+            return
+        active_jobs.add(request.jobId)
+
     try:
-        # Mark job as rendering
+        # Mark job as rendering with starting progress
         supabase.table("video_jobs").update({
             "status": "rendering",
             "render_progress": {"stage": "starting", "percent": 5},
@@ -690,17 +701,58 @@ def process_render_job(request: RenderRequest):
         # Fetch current record to support checkpointed clip reuse and audio assets
         row_res = (
             supabase.table("video_jobs")
-            .select("shots_json,voiceover_url,music_url")
+            .select("shots_json,voiceover_url,voiceover_script,music_url,music_prompt,aspect_ratio,resolution,topic")
             .eq("id", request.jobId)
             .limit(1)
             .execute()
         )
         existing_shots_dict = {}
         db_row = row_res.data[0] if (row_res.data and len(row_res.data) > 0) else {}
+        if db_row:
+            request.aspectRatio = request.aspectRatio or db_row.get("aspect_ratio") or "9:16"
+            request.resolution = request.resolution or db_row.get("resolution") or "1080p"
+            request.topic = request.topic or db_row.get("topic") or "A product launch"
+            request.voiceoverUrl = request.voiceoverUrl or db_row.get("voiceover_url")
+            request.voiceoverScript = request.voiceoverScript or db_row.get("voiceover_script")
+            request.musicUrl = request.musicUrl or db_row.get("music_url")
+            request.musicPrompt = request.musicPrompt or db_row.get("music_prompt")
+
         if db_row.get("shots_json"):
             for s in db_row["shots_json"]:
                 if isinstance(s, dict) and "index" in s:
                     existing_shots_dict[s["index"]] = s
+
+        # If request.shots is missing, parse from db_row["shots_json"]
+        if not request.shots and db_row.get("shots_json"):
+            db_raw = db_row["shots_json"]
+            if isinstance(db_raw, str):
+                try:
+                    db_raw = json.loads(db_raw)
+                except Exception:
+                    db_raw = []
+            parsed_from_db = []
+            if isinstance(db_raw, list):
+                for s in db_raw:
+                    if isinstance(s, dict):
+                        text_val = (
+                            s.get("onScreenText")
+                            or s.get("on_screen_text")
+                            or s.get("text")
+                            or s.get("subtitle")
+                            or s.get("voiceover")
+                        )
+                        parsed_from_db.append(
+                            Shot(
+                                index=int(s.get("index", len(parsed_from_db))),
+                                prompt=s.get("prompt") or s.get("visual_prompt") or s.get("description") or "Cinematic shot",
+                                negativePrompt=s.get("negativePrompt") or s.get("negative_prompt") or "",
+                                durationS=int(s.get("durationS") or s.get("duration_s") or 8),
+                                onScreenText=text_val,
+                                on_screen_text=text_val,
+                            )
+                        )
+            if parsed_from_db:
+                request.shots = parsed_from_db
 
         with tempfile.TemporaryDirectory(prefix="video-render-") as tmp:
             workdir = Path(tmp)
@@ -838,6 +890,9 @@ def process_render_job(request: RenderRequest):
             "render_progress": {"stage": "failed", "percent": 0},
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", request.jobId).execute()
+    finally:
+        with active_jobs_lock:
+            active_jobs.discard(request.jobId)
 
 # ---------------------------------------------------------
 # API Endpoints
@@ -876,7 +931,16 @@ def get_job_status(
     if not row_res.data:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    return row_res.data[0]
+    job_data = row_res.data[0]
+    # Ensure render_progress is never an empty dictionary during rendering
+    if (not job_data.get("render_progress") or job_data.get("render_progress") == {}) and job_data.get("status") == "rendering":
+        with active_jobs_lock:
+            if jobId in active_jobs:
+                job_data["render_progress"] = {"stage": "starting", "percent": 5}
+            else:
+                job_data["render_progress"] = {"stage": "queued", "percent": 0}
+
+    return job_data
 
 @app.post("/jobs/render", status_code=202)
 def render_job(
@@ -911,11 +975,21 @@ def render_job(
     # Fetch job from Supabase (or auto-create if missing)
     row_response = (
         supabase.table("video_jobs")
-        .select("id,status,output_video_url,shots_json")
+        .select("id,status,output_video_url,shots_json,topic,aspect_ratio,resolution,voiceover_url,voiceover_script,music_prompt,music_url")
         .eq("id", request.jobId)
         .limit(1)
         .execute()
     )
+
+    if row_response.data:
+        db_existing = row_response.data[0]
+        request.topic = (request.topic or "").strip() or db_existing.get("topic") or "A product launch"
+        request.aspectRatio = request.aspectRatio or db_existing.get("aspect_ratio") or "9:16"
+        request.resolution = request.resolution or db_existing.get("resolution") or "1080p"
+        request.voiceoverUrl = request.voiceoverUrl or db_existing.get("voiceover_url")
+        request.voiceoverScript = request.voiceoverScript or db_existing.get("voiceover_script")
+        request.musicUrl = request.musicUrl or db_existing.get("music_url")
+        request.musicPrompt = request.musicPrompt or db_existing.get("music_prompt")
 
     # Normalize shots from request.shots, request.shots_json, or Supabase row
     raw_shots = request.shots
@@ -956,10 +1030,10 @@ def render_job(
             )
             parsed_shots.append(
                 Shot(
-                    index=s.get("index", len(parsed_shots)),
-                    prompt=s.get("prompt", ""),
-                    negativePrompt=s.get("negativePrompt", "") or s.get("negative_prompt", ""),
-                    durationS=s.get("durationS", 8) or s.get("duration_s", 8),
+                    index=int(s.get("index", len(parsed_shots))),
+                    prompt=s.get("prompt") or s.get("visual_prompt") or s.get("description") or "Cinematic shot",
+                    negativePrompt=s.get("negativePrompt") or s.get("negative_prompt") or "",
+                    durationS=int(s.get("durationS") or s.get("duration_s") or 8),
                     onScreenText=text_val,
                     on_screen_text=text_val,
                 )
@@ -1017,13 +1091,24 @@ def render_job(
                 "message": "Job has already completed",
             }
 
-        # If already rendering, acknowledge without spawning duplicate background task
-        if existing.get("status") == "rendering":
-            return {
-                "jobId": request.jobId,
+        # Check if currently actively executing in memory
+        with active_jobs_lock:
+            if request.jobId in active_jobs:
+                return {
+                    "jobId": request.jobId,
+                    "status": "rendering",
+                    "message": "Job is currently actively rendering in background",
+                }
+
+        # Existing row: reset progress to queued so status polling reflects activity immediately
+        try:
+            supabase.table("video_jobs").update({
                 "status": "rendering",
-                "message": "Job is currently already rendering in background",
-            }
+                "render_progress": {"stage": "queued", "percent": 0},
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", request.jobId).execute()
+        except Exception as e_upd:
+            print(f"Notice: could not update queued status for existing job: {e_upd}")
 
     # Queue background task for newly created jobs or re-queued jobs
     background_tasks.add_task(process_render_job, request)
